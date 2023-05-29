@@ -20,7 +20,6 @@
 namespace processpool {
 
 enum class _IpcType {
-    ACK,
     KILL,
     DATA,
     RESULT,
@@ -184,8 +183,47 @@ private:
     T (*callback)(U);
 };
 
-template <typename T>
-void __pool_gathering_info(std::vector<T>& result, const std::vector<WorkerDescriptor>& workers) {
+template <typename T, typename U, typename C>
+struct PoolGatheringOperation {
+    using Container = std::remove_const_t<std::remove_reference_t<C>>;
+    using Param = std::remove_const_t<std::remove_reference_t<U>>;
+    using Type = std::remove_const_t<std::remove_reference_t<T>>;
+    PoolGatheringOperation() {
+        static_assert(std::is_same<typename C::value_type, T>::value);
+    }
+    virtual ~PoolGatheringOperation() = default;
+
+    virtual void add_entry(const Type& result) = 0;
+    virtual Container&& get() = 0;
+};
+
+template <typename T, typename U>
+class DefaultPoolGatheringOperation : public PoolGatheringOperation<T, U, std::vector<T>> {
+public:
+    typedef PoolGatheringOperation<T, U, std::vector<T>> Base;
+    typedef typename Base::Container Container;
+    typedef typename Base::Param Param;
+    typedef typename Base::Type Type;
+public:
+    DefaultPoolGatheringOperation():
+            Base(), results() {
+    }
+
+    virtual ~DefaultPoolGatheringOperation() = default;
+
+    virtual void add_entry(const Type& result) override {
+        results.push_back(result);
+    }
+
+    virtual Container&& get() override {
+        return std::move(results);
+    }
+private:
+    std::vector<T> results;
+};
+
+template <typename Gatherer>
+void __pool_gathering_info(Gatherer& result, const std::vector<WorkerDescriptor>& workers) {
     serialization::Buffer buffer;
     _IpcHeader header;
     std::vector<bool> is_running(workers.size(), true);
@@ -212,9 +250,9 @@ void __pool_gathering_info(std::vector<T>& result, const std::vector<WorkerDescr
             buffer.reset();
             buffer.need(header.length);
             error = recv(fd, static_cast<char*>(buffer), header.length, 0);
-            T tmp;
+            typename Gatherer::Type tmp;
             buffer >> tmp;
-            result.push_back(tmp);
+            result.add_entry(tmp);
         }
     }
 }
@@ -254,10 +292,15 @@ public:
     }
 
     template <typename Iterator, typename T, typename U>
-    std::vector<T> map_async(Iterator beg, Iterator end, T (*f)(U)) {
+    inline std::vector<T> map_async(Iterator beg, Iterator end, T (*f)(U)) {
+        return map_async<DefaultPoolGatheringOperation<T, U>>(beg, end, f);
+    }
+
+    template <typename Gatherer, typename Iterator, typename T, typename U>
+    typename Gatherer::Container map_async(Iterator beg, Iterator end, T (*f)(U)) {
         allocate_workers(f);
-        std::vector<T> ret;
-        std::thread gathering_thread(__pool_gathering_info<T>, std::ref(ret), std::ref(workers));
+        Gatherer ret;
+        std::thread gathering_thread(__pool_gathering_info<Gatherer>, std::ref(ret), std::ref(workers));
         auto it{beg};
         int counter{0};
         serialization::Buffer buff;
@@ -276,7 +319,7 @@ public:
         for(auto [pid, fd] : workers)
             send(fd, &header, sizeof(header), 0);
         gathering_thread.join();
-        return ret;
+        return ret.get();
     }
 private:
     int nb_workers;
