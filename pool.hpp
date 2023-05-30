@@ -40,8 +40,20 @@ struct WorkerDescriptor {
 };
 
 namespace serialization {
+
+class Buffer;
+
+namespace impl {
+template <typename T>
+struct BufferImpl {
+    static inline Buffer& out(Buffer&, T&);
+    static inline Buffer& in(Buffer&, const T&);
+};
+}
+
 class Buffer {
 public:
+    template <typename T> friend struct impl::BufferImpl;
     Buffer(size_t n): current_size{n}, buffer{nullptr}, idx{0} {
         buffer = new char[current_size];
         buffer[current_size] = '\0';
@@ -83,21 +95,12 @@ public:
 
     template <typename T>
     inline Buffer& operator<<(const T& obj) {
-        static_assert(not std::is_pointer<T>::value, "Unable to serialize pointers in general");
-        static_assert(std::is_fundamental<T>::value, "Specialize operator<< for uses with Buffer");
-        need(sizeof(obj));
-        std::memcpy(buffer+idx, &obj, sizeof(obj));
-        idx += sizeof(obj);
-        return *this;
+        return impl::BufferImpl<T>::in(*this, obj);
     }
 
     template <typename T>
     inline Buffer& operator>>(T& obj) {
-        static_assert(not std::is_pointer<T>::value, "Unable to deserialize pointers in general");
-        static_assert(std::is_fundamental<T>::value, "Specialize operator>> for uses with Buffer");
-        std::memcpy(&obj, buffer+idx, sizeof(obj));
-        idx += sizeof(obj);
-        return *this;
+        return impl::BufferImpl<T>::out(*this, obj);
     }
 
     inline size_t size() const {
@@ -108,33 +111,143 @@ private:
     char* buffer;
     size_t idx;
 };
-template <>
-inline Buffer& Buffer::operator<<(const std::string_view& obj) {
-    need(obj.size()+sizeof(size_t));
-    *this << static_cast<size_t>(obj.size());
-    memcpy(buffer+idx, obj.data(), obj.size());
-    idx += obj.size();
-    return *this;
+
+namespace impl {
+template <typename T>
+Buffer& BufferImpl<T>::out(Buffer& buffer, T& obj) {
+    static_assert(not std::is_pointer<T>::value, "Unable to deserialize pointers in general");
+    static_assert(std::is_fundamental<T>::value, "Specialize operator>> for uses with Buffer");
+    std::memcpy(&obj, buffer.buffer+buffer.idx, sizeof(obj));
+    buffer.idx += sizeof(obj);
+    return buffer;
 }
-template <>
-inline Buffer& Buffer::operator<<(const std::string& obj) {
-    return *this << std::string_view(obj);
-}
-template <>
-inline Buffer& Buffer::operator<<(const char* string) {
-    return *this << std::string_view(string);
+
+template <typename T>
+Buffer& BufferImpl<T>::in(Buffer& buffer, const T& obj) {
+    static_assert(not std::is_pointer<T>::value, "Unable to serialize pointers in general");
+    static_assert(std::is_fundamental<T>::value, "Specialize operator<< for uses with Buffer");
+    buffer.need(sizeof(obj));
+    std::memcpy(buffer.buffer+buffer.idx, &obj, sizeof(obj));
+    buffer.idx += sizeof(obj);
+    return buffer;
 }
 
 template <>
-inline Buffer& Buffer::operator>>(std::string& string) {
-    size_t len;
-    *this >> len;
-    string.resize(len+1);
-    for(size_t i{0}; i < len; ++i)
-        *this >> string.at(i);
-    string[len] = '\0';
-    return *this;
-}
+struct BufferImpl<std::string> {
+    static inline Buffer& out(Buffer& buffer, std::string& string) {
+        size_t len;
+        buffer >> len;
+        string.resize(len+1);
+        for(size_t i{0}; i < len; ++i)
+            buffer >> string.at(i);
+        string[len] = '\0';
+        return buffer;
+    }
+
+    static inline Buffer& in(Buffer& buffer, const std::string& string) {
+        buffer.need(string.size()+sizeof(size_t));
+        buffer << static_cast<size_t>(string.size());
+        memcpy(buffer.buffer+buffer.idx, string.data(), string.size());
+        buffer.idx += string.size();
+        return buffer;
+    }
+};
+
+template <typename T>
+struct BufferImpl<std::vector<T>> {
+    static inline Buffer& out(Buffer& buffer, std::vector<T>& obj) {
+        obj.clear();
+        size_t N;
+        buffer >> N;
+        obj.reserve(N);
+        for(size_t i{0}; i < N; ++i) {
+            T tmp;
+            buffer >> tmp;
+            obj.emplace_back(std::move(tmp));
+        }
+        return buffer;
+    }
+    static inline Buffer& in(Buffer& buffer, const std::vector<T>& obj) {
+        buffer << obj.size();
+        for(auto& x : obj)
+            buffer << x;
+        return buffer;
+    }
+};
+
+template <typename Tuple, size_t Idx>
+struct _TupleIterator {
+    template <typename Caller, typename... Args>
+    static void apply(Tuple& tuple, Args&... args) {
+        if constexpr(Idx < std::tuple_size<Tuple>::value) {
+            Caller::callback(std::get<Idx>(tuple), args...);
+            _TupleIterator<Tuple, Idx+1>::template apply<Caller>(tuple, args...);
+        }
+    }
+    template <typename Caller, typename... Args>
+    static void apply(const Tuple& tuple, Args&... args) {
+        if constexpr(Idx < std::tuple_size<Tuple>::value) {
+            Caller::callback(std::get<Idx>(tuple), args...);
+            _TupleIterator<Tuple, Idx+1>::template apply<Caller>(tuple, args...);
+        }
+    }
+};
+
+template <typename Tuple>
+struct TupleIterator {
+    template <typename Caller, typename... Args>
+    static void apply(Tuple& tuple, Args&... args) {
+        _TupleIterator<Tuple, static_cast<size_t>(0)>::template apply<Caller, Args...>(tuple, args...);
+    }
+    template <typename Caller, typename... Args>
+    static void apply(const Tuple& tuple, Args&... args) {
+        _TupleIterator<Tuple, static_cast<size_t>(0)>::template apply<Caller, Args...>(tuple, args...);
+    }
+};
+
+struct OutCaller {
+    template <typename T>
+    static void callback(T& x, Buffer& buffer) {
+        buffer >> x;
+    }
+};
+struct InCaller {
+    template <typename T>
+    static void callback(const T& x, Buffer& buffer) {
+        buffer << x;
+    }
+};
+template <typename... Args>
+struct BufferImpl<std::tuple<Args...>> {
+    using Tuple = std::tuple<Args...>;
+    static inline Buffer& out(Buffer& buffer, Tuple& t) {
+        TupleIterator<Tuple>::template apply<OutCaller>(t, buffer);
+        return buffer;
+    }
+
+    static inline Buffer& in(Buffer& buffer, const Tuple& t) {
+        //TupleIterator<Tuple>::template apply<InCaller>(const_cast<std::tuple<Args...>&>(t), buffer);
+        TupleIterator<Tuple>::template apply<InCaller>(t, buffer);
+        return buffer;
+
+    }
+};
+
+template <typename T, typename U>
+struct BufferImpl<std::pair<T, U>> {
+    static inline Buffer& out(Buffer& buffer, std::pair<T, U>& obj) {
+        buffer >> obj.first;
+        buffer >> obj.second;
+        return buffer;
+    }
+    static inline Buffer& in(Buffer& buffer, const std::pair<T, U>& obj) {
+        buffer << obj.first;
+        buffer << obj.second;
+        return buffer;
+    }
+};
+
+}  // processpool::serialization::impl
 
 }
 
@@ -282,7 +395,7 @@ public:
     template <typename Iterator, typename T, typename U>
     std::vector<T> map(Iterator beg, Iterator end, T(*f)(U)) {
         std::vector<T> ret;
-        ret.reserve(std::distance(beg, end));
+        //ret.reserve(std::distance(beg, end));
         auto it{beg};
         while(it != end) {
             ret.push_back(f(*it));
@@ -335,6 +448,7 @@ private:
         for(int i{0}; i < nb_workers; ++i) {
             int sockets[2];
             int error{socketpair(AF_LOCAL, SOCK_STREAM, 0, sockets)};
+            (void)error;
             // TODO: check error
             pid_t pid{fork()};
             if(pid == 0) {
