@@ -8,6 +8,7 @@
 
 #include <cstring>
 
+#include <array>
 #include <iostream>
 #include <functional>
 #include <memory>
@@ -169,6 +170,23 @@ struct BufferImpl<std::vector<T>> {
     }
     static inline Buffer& in(Buffer& buffer, const std::vector<T>& obj) {
         buffer << obj.size();
+        for(auto& x : obj)
+            buffer << x;
+        return buffer;
+    }
+};
+
+template <typename T, size_t N>
+struct BufferImpl<std::array<T, N>> {
+    static inline Buffer& out(Buffer& buffer, std::array<T, N>& obj) {
+        for(size_t i{0}; i < N; ++i) {
+            T tmp;
+            buffer >> tmp;
+            obj[i] = std::move(tmp);
+        }
+        return buffer;
+    }
+    static inline Buffer& in(Buffer& buffer, const std::array<T, N>& obj) {
         for(auto& x : obj)
             buffer << x;
         return buffer;
