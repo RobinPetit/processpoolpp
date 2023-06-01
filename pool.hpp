@@ -55,9 +55,9 @@ struct BufferImpl {
 class Buffer {
 public:
     template <typename T> friend struct impl::BufferImpl;
-    Buffer(size_t n): current_size{n}, buffer{nullptr}, idx{0} {
+    Buffer(size_t n): current_size{std::max(static_cast<size_t>(1), n)}, buffer{nullptr}, idx{0} {
         buffer = new char[current_size];
-        buffer[current_size] = '\0';
+        buffer[current_size-1] = '\0';
     }
     Buffer(): Buffer(1) {
     }
@@ -179,11 +179,8 @@ struct BufferImpl<std::vector<T>> {
 template <typename T, size_t N>
 struct BufferImpl<std::array<T, N>> {
     static inline Buffer& out(Buffer& buffer, std::array<T, N>& obj) {
-        for(size_t i{0}; i < N; ++i) {
-            T tmp;
-            buffer >> tmp;
-            obj[i] = std::move(tmp);
-        }
+        for(auto& x : obj)
+            buffer >> x;
         return buffer;
     }
     static inline Buffer& in(Buffer& buffer, const std::array<T, N>& obj) {
@@ -229,12 +226,14 @@ struct OutCaller {
         buffer >> x;
     }
 };
+
 struct InCaller {
     template <typename T>
     static void callback(const T& x, Buffer& buffer) {
         buffer << x;
     }
 };
+
 template <typename... Args>
 struct BufferImpl<std::tuple<Args...>> {
     using Tuple = std::tuple<Args...>;
@@ -244,7 +243,6 @@ struct BufferImpl<std::tuple<Args...>> {
     }
 
     static inline Buffer& in(Buffer& buffer, const Tuple& t) {
-        //TupleIterator<Tuple>::template apply<InCaller>(const_cast<std::tuple<Args...>&>(t), buffer);
         TupleIterator<Tuple>::template apply<InCaller>(t, buffer);
         return buffer;
 
@@ -272,13 +270,16 @@ struct BufferImpl<std::pair<T, U>> {
 template <typename T, typename U>
 class Worker {
 public:
-    Worker(int fd, T (*f)(U)): socket_fd{fd}, callback{f} {
+    Worker(int fd, T (*f)(U), size_t size):
+            socket_fd{fd}, callback{f}, results(), nb_tasks{size} {
     }
     void start() {
         bool running{true};
         _IpcHeader header;
         serialization::Buffer buffer;
-        std::remove_const_t<std::remove_reference_t<U>> param;
+        typedef std::remove_const_t<std::remove_reference_t<U>> Param;
+        Param param;
+        T result;
         while(running) {
             buffer.reset();
             recv(socket_fd, static_cast<void*>(&header), sizeof(header), 0);
@@ -291,14 +292,12 @@ public:
                 recv(socket_fd, static_cast<char*>(buffer), header.length, 0);
                 buffer >> param;
                 result = callback(param);
-                buffer.reset();
-                buffer << result;
-                header.type = _IpcType::RESULT;
-                header.length = buffer.size();
-                send(socket_fd, static_cast<void*>(&header), sizeof(header), 0);
-                send(socket_fd, static_cast<char*>(buffer), buffer.size(), 0);
+                results.emplace_back(std::move(result));
+                if(results.size() == nb_tasks)
+                    _send(buffer);
                 break;
             case _IpcType::EOT:
+                _send(buffer);
                 send(socket_fd, &header, sizeof(header), 0);
                 break;
             default:
@@ -310,8 +309,20 @@ public:
 
 private:
     int socket_fd;
-    T result;
     T (*callback)(U);
+    std::vector<T> results;
+    size_t nb_tasks;
+
+    inline void _send(serialization::Buffer& buffer) {
+        if(results.size() == 0)
+            return;
+        buffer.reset();
+        buffer << results;
+        _IpcHeader header{_IpcType::RESULT, buffer.size()};
+        send(socket_fd, static_cast<void*>(&header), sizeof(header), 0);
+        send(socket_fd, static_cast<char*>(buffer), buffer.size(), 0);
+        results.clear();
+    }
 };
 
 template <typename T, typename U, typename C>
@@ -353,6 +364,15 @@ private:
     std::vector<T> results;
 };
 
+static inline void read_to_buffer(serialization::Buffer& buffer, int fd, long int len) {
+    long int current_size{0};
+    buffer.need(len);
+    while(current_size < len)
+        current_size += recv(fd, static_cast<char*>(buffer)+current_size, len, 0);
+    if(current_size != len)
+        std::cerr << "\t\t\t\tExpected " << len << " bytes but got " << current_size << std::endl;
+}
+
 template <typename Gatherer>
 void __pool_gathering_info(Gatherer& result, const std::vector<WorkerDescriptor>& workers) {
     serialization::Buffer buffer;
@@ -380,18 +400,19 @@ void __pool_gathering_info(Gatherer& result, const std::vector<WorkerDescriptor>
             }
             buffer.reset();
             buffer.need(header.length);
-            error = recv(fd, static_cast<char*>(buffer), header.length, 0);
-            typename Gatherer::Type tmp;
+            read_to_buffer(buffer, fd, header.length);
+            typename std::vector<typename Gatherer::Type> tmp;
             buffer >> tmp;
-            result.add_entry(tmp);
+            for(const auto& x : tmp)
+                result.add_entry(x);
         }
     }
 }
 
 class ProcessPool {
 public:
-    ProcessPool(int n):
-            nb_workers(n), workers() {
+    ProcessPool(int n, size_t nb_tasks_per_child=1):
+            nb_workers(n), workers(), nb_tasks{nb_tasks_per_child} {
     }
 
     ~ProcessPool() {
@@ -413,7 +434,6 @@ public:
     template <typename Iterator, typename T, typename U>
     std::vector<T> map(Iterator beg, Iterator end, T(*f)(U)) {
         std::vector<T> ret;
-        //ret.reserve(std::distance(beg, end));
         auto it{beg};
         while(it != end) {
             ret.push_back(f(*it));
@@ -424,20 +444,32 @@ public:
 
     template <typename Iterator, typename T, typename U>
     inline std::vector<T> map_async(Iterator beg, Iterator end, T (*f)(U)) {
-        return map_async<DefaultPoolGatheringOperation<T, U>>(beg, end, f);
+        return map_async<DefaultPoolGatheringOperation<T, U>>(
+            beg, end, f
+        );
     }
 
-    template <typename Gatherer, typename Iterator, typename T, typename U>
-    typename Gatherer::Container map_async(Iterator beg, Iterator end, T (*f)(U)) {
+    template <
+        typename Gatherer,
+        typename Iterator,
+        typename T,
+        typename U
+    >
+    typename Gatherer::Container map_async(
+            Iterator beg, Iterator end, T (*f)(U)) {
         allocate_workers(f);
         Gatherer ret;
-        std::thread gathering_thread(__pool_gathering_info<Gatherer>, std::ref(ret), std::ref(workers));
+        std::thread gathering_thread(
+            __pool_gathering_info<Gatherer>,
+            std::ref(ret),
+            std::ref(workers)
+        );
         auto it{beg};
         int counter{0};
         serialization::Buffer buff;
         while(it != end) {
             auto fd{workers[counter].socket_fd};
-            const auto& data{*it};
+            const U& data{*it};
             buff.reset();
             buff << data;
             _IpcHeader header{_IpcType::DATA, buff.size()};
@@ -455,6 +487,7 @@ public:
 private:
     int nb_workers;
     std::vector<WorkerDescriptor> workers;
+    size_t nb_tasks;
 
     template <typename T, typename U>
     void allocate_workers(T (*callback)(U)) {
@@ -470,7 +503,7 @@ private:
             // TODO: check error
             pid_t pid{fork()};
             if(pid == 0) {
-                Worker(sockets[0], callback).start();
+                Worker(sockets[0], callback, nb_tasks).start();
                 exit(EXIT_SUCCESS);
             } else {
                 workers.emplace_back(pid, sockets[1]);
